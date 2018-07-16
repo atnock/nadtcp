@@ -7,11 +7,17 @@ if __name__ == "__main__":
 
     _LOGGER = logging.getLogger(__name__)
 
-    if __name__ == "__main__":
-        loop = asyncio.get_event_loop()
+    loop = asyncio.get_event_loop()
 
-        nad_client = nadtcp.NADC338Protocol.create_nad_connection(loop=loop, target_ip='192.168.1.121')
 
-        loop.run_until_complete(nad_client)
+    async def connect():
+        _, nad_client = await nadtcp.NADC338Protocol.create_nad_connection(loop=loop, target_ip='192.168.1.121')
 
-        loop.run_forever()
+        state = await nad_client.state(force_refresh=True)
+
+        _LOGGER.info("Connected %s" % state)
+
+
+    loop.run_until_complete(connect())
+
+    loop.run_forever()

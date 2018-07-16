@@ -172,8 +172,7 @@ class NADC338Protocol(asyncio.Protocol):
             self._exec_command(CMD_MAIN, '?')
 
             try:
-                with async_timeout.timeout(timeout, loop=self._loop):
-                    await self._state_waiter
+                await asyncio.wait_for(self._state_waiter, timeout=timeout, loop=self._loop)
             finally:
                 self._state_waiter = None
 

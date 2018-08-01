@@ -1,6 +1,5 @@
 import asyncio
 import logging
-from functools import partial
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -77,153 +76,160 @@ COMMAND_SCHEMA = {
 }
 
 
-class NADC338Protocol(asyncio.Protocol):
+class NADC338Client(object):
     AVAILABLE_SOURCES = COMMAND_SCHEMA[CMD_SOURCE]['values']
 
     PORT = 30001
 
-    transport = None  # type: asyncio.Transport
-
-    def __init__(self, loop=None, state_changed_cb=None, disconnect_cb=None) -> None:
+    def __init__(self, host, loop,
+                 reconnect_timeout=10,
+                 state_batching_timeout=0.1,
+                 state_changed_cb=None) -> None:
+        self._host = host
         self._loop = loop
-        self._buffer = ''
+        self._reconnect_timeout = reconnect_timeout
+
+        self._state_changed_cb = state_changed_cb
+        self._state_batching_timeout = state_batching_timeout
+
+        self._reader = None
+        self._writer = None
+
+        self._connection_loop_ft = None
+        self._state_changed_waiter = None
+
         self._state = {}
 
-        self._state_waiter = None
-        self._state_changed_cb = state_changed_cb
-        self._disconnect_cb = disconnect_cb
+    async def _state_changed_batch(self):
+        await asyncio.sleep(self._state_batching_timeout)
+        self._state_changed_cb(self._state)
+        self._state_changed_waiter = None
 
-    def connection_made(self, transport):
-        self.transport = transport
-        _LOGGER.debug("connected")
+    def _parse_data(self, data):
+        key, value = data.split('=')
 
-    def data_received(self, data):
-        data = data.decode('utf-8').replace('\x00', '')
+        if 'type' in COMMAND_SCHEMA[key]:
+            value = COMMAND_SCHEMA[key]['type'](value)
 
-        _LOGGER.debug('received data: %s', data)
+        old_value = self._state.get(key)
 
-        self._buffer += data
+        if value != old_value:
+            _LOGGER.debug("State changed %s=%s", key, value)
+            
+            self._state[key] = value
 
-        self._drain_buffer()
+            if self._state_changed_cb and self._state_changed_waiter is None:
+                self._state_changed_waiter = asyncio.ensure_future(
+                    self._state_changed_batch(), loop=self._loop)
 
-    def connection_lost(self, exc):
-        if exc:
-            _LOGGER.error(exc, exc_info=True)
-        else:
-            _LOGGER.info('disconnected because of close/abort.')
-        if self._disconnect_cb:
-            self._disconnect_cb(exc)
+    async def _connection_loop(self):
+        try:
+            self._reader, self._writer = await asyncio.open_connection(self._host, self.PORT, loop=self._loop)
+            self.exec_command('Main', '?')
 
-    def _drain_buffer(self):
-        new_state = {}
+            while self._reader and not self._reader.at_eof():
+                data = await self._reader.readline()
+                if data:
+                    self._parse_data(data.decode('utf-8').strip())
+        finally:
+            if self._state_changed_waiter and not self._state_changed_waiter.done():
+                self._state_changed_waiter.cancel()
 
-        while '\r\n' in self._buffer:
-            line, self._buffer = self._buffer.split('\r\n', 1)
+            self._writer = None
+            self._reader = None
 
-            key, value = line.split('=')
+            if self._state:
+                self._state.clear()
 
-            if 'type' in COMMAND_SCHEMA[key]:
-                value = COMMAND_SCHEMA[key]['type'](value)
+                if self._state_changed_cb:
+                    self._state_changed_cb(self._state)
 
-            new_state[key] = value
+    async def disconnect(self):
+        _LOGGER.debug("Disconnecting from %s", self._host)
 
-        if new_state:
-            self._state.update(new_state)
+        if self._writer:
+            # send EOF, let the connection exit gracefully
+            if self._writer.can_write_eof():
+                _LOGGER.debug("Disconnect: writing EOF")
+                self._writer.write_eof()
+            # socket cannot send EOF, cancel connection
+            elif self._connection_loop:
+                _LOGGER.debug("Disconnect: force")
+                self._connection_loop_ft.cancel()
 
-            if self._state_waiter is not None and \
-                    len(self._state) == len(COMMAND_SCHEMA) - 1:
-                self._state_waiter.set_result(True)
+            await self._connection_loop_ft
 
-            if self._state_changed_cb:
-                self._state_changed_cb(self._state)
-
-    def _send(self, data: str):
-        _LOGGER.debug('writing data: %s', repr(data))
-        packet = data + '\r\n'
-        self.transport.write(packet.encode('utf-8'))
-
-    def _exec_command(self, command, operator, value=None):
-        cmd_desc = COMMAND_SCHEMA[command]
-        if operator in cmd_desc['supported_operators']:
-            if operator is '=' and value is None:
-                raise ValueError("No value provided")
-            elif operator in ['?', '-', '+'] and value is not None:
-                raise ValueError("Operator \'%s\' cannot be called with a value" % operator)
-
-            if value is None:
-                cmd = command + operator
-            else:
-                if 'values' in cmd_desc and value not in cmd_desc['values']:
-                    raise ValueError("Given value \'%s\' is not one of %s" % (value, cmd_desc['values']))
-
-                cmd = command + operator + str(value)
-        else:
-            raise ValueError("Invalid operator provided %s" % operator)
-
-        self._send(cmd)
-
-    async def state(self, force_refresh=False, timeout=1):
-        """Return the state of the device."""
-
-        if force_refresh:
-            self._state_waiter = self._loop.create_future()
-            self._state.clear()
-
-            self._exec_command(CMD_MAIN, '?')
-
+    async def run_loop(self):
+        while True:
+            _LOGGER.debug("Connecting to %s", self._host)
+            self._connection_loop_ft = asyncio.ensure_future(
+                self._connection_loop(), loop=self._loop)
             try:
-                await asyncio.wait_for(self._state_waiter, timeout=timeout, loop=self._loop)
-            finally:
-                self._state_waiter = None
+                await self._connection_loop_ft
+                # EOF reached, break reconnect loop
+                _LOGGER.debug("EOF reached")
+                break
+            except asyncio.CancelledError:
+                # force disconnect, break reconnect loop
+                _LOGGER.debug("Force disconnect")
+                break
+            except (ConnectionRefusedError, OSError, asyncio.TimeoutError) as e:
+                _LOGGER.exception("Disconnected, reconnecting in %ss", self._reconnect_timeout, exc_info=e)
+                await asyncio.sleep(self._reconnect_timeout)
 
-        return self._state
+    def exec_command(self, command, operator, value=None):
+        if self._writer:
+            cmd_desc = COMMAND_SCHEMA[command]
+            if operator in cmd_desc['supported_operators']:
+                if operator is '=' and value is None:
+                    raise ValueError("No value provided")
+                elif operator in ['?', '-', '+'] and value is not None:
+                    raise ValueError(
+                        "Operator \'%s\' cannot be called with a value" % operator)
+
+                if value is None:
+                    cmd = command + operator
+                else:
+                    if 'values' in cmd_desc and value not in cmd_desc['values']:
+                        raise ValueError("Given value \'%s\' is not one of %s" % (
+                            value, cmd_desc['values']))
+
+                    cmd = command + operator + str(value)
+            else:
+                raise ValueError("Invalid operator provided %s" % operator)
+
+            self._writer.write(cmd.encode('utf-8'))
 
     def power_off(self):
         """Power the device off."""
-        self._exec_command(CMD_POWER, '=', MSG_OFF)
+        self.exec_command(CMD_POWER, '=', MSG_OFF)
 
     def power_on(self):
         """Power the device on."""
-        self._exec_command(CMD_POWER, '=', MSG_ON)
+        self.exec_command(CMD_POWER, '=', MSG_ON)
 
     def set_volume(self, volume):
         """Set volume level of the device. Accepts integer values 0-200."""
-        self._exec_command(CMD_VOLUME, '=', float(volume))
+        self.exec_command(CMD_VOLUME, '=', float(volume))
 
     def volume_down(self):
-        self._exec_command(CMD_VOLUME, '-')
+        self.exec_command(CMD_VOLUME, '-')
 
     def volume_up(self):
-        self._exec_command(CMD_VOLUME, '+')
+        self.exec_command(CMD_VOLUME, '+')
 
     def mute(self):
         """Mute the device."""
-        self._exec_command(CMD_MUTE, '=', MSG_ON)
+        self.exec_command(CMD_MUTE, '=', MSG_ON)
 
     def unmute(self):
         """Unmute the device."""
-        self._exec_command(CMD_MUTE, '=', MSG_OFF)
+        self.exec_command(CMD_MUTE, '=', MSG_OFF)
 
     def select_source(self, source):
         """Select a source from the list of sources."""
-        self._exec_command(CMD_SOURCE, '=', source)
+        self.exec_command(CMD_SOURCE, '=', source)
 
     def available_sources(self):
         """Return a list of available sources."""
         return list(self.AVAILABLE_SOURCES)
-
-    @staticmethod
-    def create_nad_connection(loop, target_ip, state_changed_cb=None, disconnect_cb=None):
-        if loop is None:
-            loop = asyncio.get_event_loop()
-
-        _LOGGER.debug("Initializing nad connection to %s", target_ip)
-
-        protocol = partial(
-            NADC338Protocol,
-            loop=loop,
-            state_changed_cb=state_changed_cb,
-            disconnect_cb=disconnect_cb
-        )
-
-        return loop.create_connection(protocol, target_ip, NADC338Protocol.PORT)

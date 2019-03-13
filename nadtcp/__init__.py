@@ -71,7 +71,8 @@ C338_CMDS = {
          },
     'Main.Source':
         {'supported_operators': ['+', '-', '=', '?'],
-         'values': ["Stream", "Wireless", "TV", "Phono", "Coax1", "Coax2", "Opt1", "Opt2"]
+         'values': ["Stream", "Wireless", "TV", "Phono", "Coax1", "Coax2",
+                    "Opt1", "Opt2"]
          },
     'Main.Version':
         {'supported_operators': ['?'],
@@ -84,32 +85,24 @@ C338_CMDS = {
 }
 
 
-class NADReceiverTCPC338(object):
-    """
-    Support NAD amplifiers that use tcp for communication.
-
-    Known supported model: NAD C338.
-    """
-
+class NADReceiverTCPC338(asyncio.Protocol):
     PORT = 30001
 
     CMD_MIN_INTERVAL = 0.15
 
-    def __init__(self, host, loop,
-                 reconnect_timeout=10,
-                 state_changed_cb=None):
-        self._host = host
+    def __init__(self, host, loop, state_changed_cb=None,
+                 reconnect_interval=15, connect_timeout=10):
         self._loop = loop
-
-        self._reconnect_timeout = reconnect_timeout
+        self._host = host
         self._state_changed_cb = state_changed_cb
+        self._reconnect_interval = reconnect_interval
+        self._connect_timeout = connect_timeout
 
-        self._reader, self._writer = None, None
+        self._transport = None
+        self._buffer = ''
+        self._last_cmd_time = 0
 
-        self._connection_task = None
-
-        self.last_cmd_time = 0
-
+        self._closing = False
         self._state = {}
 
     @staticmethod
@@ -131,8 +124,8 @@ class NADReceiverTCPC338(object):
                     if 'type' in cmd_desc and cmd_desc['type'] == bool:
                         value = cmd_desc['values'][int(value)]
                     elif value not in cmd_desc['values']:
-                        raise ValueError("Given value \'%s\' is not one of %s" % (
-                            value, cmd_desc['values']))
+                        raise ValueError("Given value \'%s\' is not one of %s"
+                                         % (value, cmd_desc['values']))
 
                 cmd = command + operator + str(value)
         else:
@@ -140,16 +133,10 @@ class NADReceiverTCPC338(object):
 
         return cmd
 
-    def _state_changed(self):
-        if self._state_changed_cb:
-            self._state_changed_cb(self._state)
+    @staticmethod
+    def parse_part(response):
+        key, value = response.split('=')
 
-    def _update_state(self, data):
-        _LOGGER.debug("Received data %s", data)
-
-        data = data.decode('utf-8').replace('\x00', '').strip()
-
-        key, value = data.split('=')
         cmd_desc = C338_CMDS[key]
 
         # convert the data to the correct type
@@ -159,92 +146,92 @@ class NADReceiverTCPC338(object):
             else:
                 value = cmd_desc['type'](value)
 
-        self._state[key] = value
+        return key, value
 
-        # volume changes implicitly disables mute, after min volume it mutes, but we don't get any data for that...
-        if key == 'Main.Volume':
-            self._state['Main.Mute'] = False
+    def connection_made(self, transport):
+        self._transport = transport
 
-        self._state_changed()
-
-    async def connect(self):
-        if self._connection_task is None:
-            self._connection_task = self._loop.create_task(self._connection_loop())
-
-    async def disconnect(self):
-        """Disconnect from the device."""
-        if self._writer:
-            _LOGGER.debug("Disconnecting from %s", self._host)
-            # send EOF, let the connection exit gracefully
-            if self._writer.can_write_eof():
-                _LOGGER.debug("Disconnect: writing EOF")
-                self._writer.write_eof()
-            # socket cannot send EOF, cancel connection
-            elif self._connection_task:
-                _LOGGER.debug("Disconnect: force")
-                self._connection_task.cancel()
-
-            await self._connection_task
-
-    async def _connect(self):
-        _LOGGER.debug("Connecting to %s", self._host)
-        self._reader, self._writer = await asyncio.open_connection(self._host, self.PORT, loop=self._loop)
-
-        sock = self._writer.transport.get_extra_info('socket')
+        sock = self._transport.get_extra_info('socket')
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
         sock.setsockopt(socket.SOL_TCP, socket.TCP_KEEPIDLE, 1)
         sock.setsockopt(socket.SOL_TCP, socket.TCP_KEEPINTVL, 10)
         sock.setsockopt(socket.SOL_TCP, socket.TCP_KEEPCNT, 3)
 
-    async def _read_until_eof(self):
-        while self._reader and not self._reader.at_eof():
-            data = await self._reader.readline()
-            if data:
-                self._update_state(data)
+        _LOGGER.debug("Connected to %s", self._host)
+        self._loop.create_task(self.exec_command('Main', '?'))
 
-    async def _connection_loop(self):
-        """Start the connection loop which handles reconnects."""
-        while True:
+    def data_received(self, data):
+        data = data.decode('utf-8').replace('\x00', '')
+
+        self._buffer += data
+
+        new_state = {}
+        while '\r\n' in self._buffer:
+            line, self._buffer = self._buffer.split('\r\n', 1)
+            key, value = self.parse_part(line)
+            new_state[key] = value
+
+            # volume changes implicitly disables mute,
+            if key == 'Main.Volume' and self._state.get('Main.Mute') is True:
+                new_state['Main.Mute'] = False
+
+        if new_state:
+            _LOGGER.debug("state changed %s", new_state)
+            self._state.update(new_state)
+            if self._state_changed_cb:
+                self._state_changed_cb(self._state)
+
+    def connection_lost(self, exc):
+        if exc:
+            _LOGGER.error("Disconnected from %s because of %s", self._host, exc)
+        else:
+            _LOGGER.debug("Disconnected from %s because of close/abort.",
+                          self._host)
+        self._transport = None
+
+        self._state.clear()
+        if self._state_changed_cb:
+            self._state_changed_cb(self._state)
+
+        if not self._closing:
+            self._loop.create_task(self.connect())
+
+    async def connect(self):
+        self._closing = False
+
+        while not self._closing and not self._transport:
             try:
-                await self._connect()
-                await self.exec_command('Main', '?')
-                await self._read_until_eof()
-                # EOF reached, break reconnect loop
-                _LOGGER.debug("EOF reached")
-                break
-            except asyncio.CancelledError:
-                # force disconnect, break reconnect loop
-                _LOGGER.debug("Force disconnect")
-                break
-            except (ConnectionRefusedError, OSError, asyncio.TimeoutError) as e:
-                _LOGGER.exception("Disconnected, reconnecting in %ss",
-                                  self._reconnect_timeout, exc_info=e)
-                await asyncio.sleep(self._reconnect_timeout)
-            finally:
-                self._writer, self._reader = None, None
-                self._state.clear()
-                self._state_changed()
+                _LOGGER.debug("Connecting to %s", self._host)
+                connection = self._loop.create_connection(
+                    lambda: self, self._host, NADReceiverTCPC338.PORT)
+                await asyncio.wait_for(
+                    connection, timeout=self._connect_timeout, loop=self._loop)
+                return
+            except (ConnectionRefusedError, OSError, asyncio.TimeoutError):
+                _LOGGER.exception("Error connecting to %s, reconnecting in %ss",
+                                  self._host, self._reconnect_interval,
+                                  exc_info=True)
+                await asyncio.sleep(self._reconnect_interval, loop=self._loop)
+
+    async def disconnect(self):
+        self._closing = True
+        if self._transport:
+            self._transport.close()
 
     async def exec_command(self, command, operator, value=None):
-        """Execute a command on the device."""
-        if self._writer:
+        if self._transport:
             # throttle commands to CMD_MIN_INTERVAL
-            cmd_wait_time = (self.last_cmd_time + self.CMD_MIN_INTERVAL) - time.time()
+            cmd_wait_time = (self._last_cmd_time
+                             + NADReceiverTCPC338.CMD_MIN_INTERVAL) - time.time()
             if cmd_wait_time > 0:
                 await asyncio.sleep(cmd_wait_time)
-
             cmd = self.make_command(command, operator, value)
-            self._writer.write(cmd.encode('utf-8'))
+            self._transport.write(cmd.encode('utf-8'))
 
-            self.last_cmd_time = time.time()
+            self._last_cmd_time = time.time()
 
     async def status(self):
-        """
-        Return the status of the device.
-
-        Returns a dictionary with keys 'Main.Volume' (int -80-0) , 'Main.Power' (bool),
-         'Main.Mute' (bool) and 'Main.Source' (str).
-        """
+        """Return the state of the device."""
         return self._state
 
     async def power_off(self):
@@ -256,15 +243,13 @@ class NADReceiverTCPC338(object):
         await self.exec_command(CMD_POWER, '=', True)
 
     async def set_volume(self, volume):
-        """Set volume level of the device in dBa. Accepts integer values -80-0."""
+        """Set volume level of the device. Accepts integer values -80-0."""
         await self.exec_command(CMD_VOLUME, '=', float(volume))
 
     async def volume_down(self):
-        """Decrease the volume of the device."""
         await self.exec_command(CMD_VOLUME, '-')
 
     async def volume_up(self):
-        """Increase the volume of the device."""
         await self.exec_command(CMD_VOLUME, '+')
 
     async def mute(self):
@@ -279,6 +264,6 @@ class NADReceiverTCPC338(object):
         """Select a source from the list of sources."""
         await self.exec_command(CMD_SOURCE, '=', source)
 
-    def available_sources(self):
+    async def available_sources(self):
         """Return a list of available sources."""
         return list(C338_CMDS[CMD_SOURCE]['values'])

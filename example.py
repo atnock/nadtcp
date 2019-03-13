@@ -13,13 +13,13 @@ if __name__ == "__main__":
     def state_changed(state):
         pass
 
-    client = nadtcp.NADC338Client('192.168.1.121', loop, state_changed_cb=state_changed)
+
+    client = nadtcp.NADReceiverTCPC338('192.168.1.121', loop, state_changed_cb=state_changed)
+
 
     async def test():
-        asyncio.ensure_future(client.run_loop())
-        while True:
-            client.exec_command('Main', '?')
-            await asyncio.sleep(5)
+        await client.connect()
+
 
     loop.run_until_complete(test())
 

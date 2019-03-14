@@ -264,6 +264,6 @@ class NADReceiverTCPC338(asyncio.Protocol):
         """Select a source from the list of sources."""
         await self.exec_command(CMD_SOURCE, '=', source)
 
-    async def available_sources(self):
+    def available_sources(self):
         """Return a list of available sources."""
         return list(C338_CMDS[CMD_SOURCE]['values'])

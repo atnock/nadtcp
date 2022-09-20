@@ -1,3 +1,3 @@
-**UNMAINTAINED: I've sold my NAD amplifier, so I cannot continue maintaining it. Feel free to fork**
+Maintained fork from https://github.com/martonperei/ha-nadtcp
 
 # nadtcp

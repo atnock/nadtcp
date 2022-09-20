@@ -205,13 +205,13 @@ class NADReceiverTCPC338(asyncio.Protocol):
                 connection = self._loop.create_connection(
                     lambda: self, self._host, NADReceiverTCPC338.PORT)
                 await asyncio.wait_for(
-                    connection, timeout=self._connect_timeout, loop=self._loop)
+                    connection, timeout=self._connect_timeout)
                 return
             except (ConnectionRefusedError, OSError, asyncio.TimeoutError):
                 _LOGGER.exception("Error connecting to %s, reconnecting in %ss",
                                   self._host, self._reconnect_interval,
                                   exc_info=True)
-                await asyncio.sleep(self._reconnect_interval, loop=self._loop)
+                await asyncio.sleep(self._reconnect_interval)
 
     async def disconnect(self):
         self._closing = True
